@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ReconEngine AI — Enterprise Reconciliation Suite</title>
+  
+  <!-- CDNs -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { 
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace']
+          },
+          colors: {
+            rzp: {
+              navy: '#02042B',
+              darkBlue: '#0A192F',
+              blue: '#0052FF',
+              hoverBlue: '#0047E0',
+              accent: '#05CE91',
+              lightBg: '#F8FAFC'
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    .rzp-glow {
+      box-shadow: 0 10px 30px -5px rgba(0, 82, 255, 0.25);
+    }
+    @keyframes pulse-ring {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.05); opacity: 0.4; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+    .pulse-ring { animation: pulse-ring 2s infinite ease-in-out; }
+  </style>
+
+  <script>
+    // Served by the Spring Boot backend -> same origin. Opened from disk -> default local backend.
+    const API_BASE_URL = (location.protocol === 'http:' || location.protocol === 'https:')
+      ? `${location.origin}/api`
+      : 'http://localhost:8081/api';
+    let dataset = [];
+    let currentFilter = 'ALL';
+    let activeTxn = null;
+    let selectedTxnIds = new Set();
+    let liveForexRates = { USD: 83.45, EUR: 90.12, GBP: 105.30, AUD: 54.20 };
+    let isDataLoaded = false;
+
+    // Mirrors the Java MatchingEngine so the page also works as a static site (Netlify / file://)
+    const MDR_RATE = 0.02;
+    const MDR_TOLERANCE = 0.05;
+
+    // Returns { ok, data } for a JSON response, or null when the backend is unreachable
+    // (network error, or a static host answering with a 404 / HTML page instead of the API).
+    async function apiRequest(path, options) {
+      try {
+        const res = await fetch(`${API_BASE_URL}${path}`, options);
+        const type = res.headers.get('content-type') || '';
+        if (!type.includes('application/json')) return null;
+        return { ok: res.ok, data: await res.json() };
+      } catch (e) {
+        console.warn(`Backend unreachable for ${path}, using in-browser engine:`, e);
+        return null;
+      }
+    }
+
+    function money(n) {
+      return Math.round((Number(n) || 0) * 100) / 100;
+    }
+
+    function classifyTxn(txn) {
+      const gatewayAmt = money(txn.gatewayAmt);
+      const bankAmt = money(txn.bankAmt);
+      const mdrFee = money(gatewayAmt * MDR_RATE);
+      const diff = money(Math.abs(gatewayAmt - bankAmt));
+      let status, rootCause;
+      if (diff === 0) {
+        status = 'EXACT_MATCH';
+        rootCause = 'Auto-matched: UTR, Gateway Payout & Bank Credit Verified';
+      } else if (Math.abs(diff - mdrFee) <= MDR_TOLERANCE) {
+        status = 'PARTIAL_MATCH';
+        rootCause = `Verified: Net Settlement Variance equals Standard ${MDR_RATE * 100}% MDR Rate`;
+      } else {
+        status = 'UNRESOLVED_EXCEPTION';
+        const direction = bankAmt < gatewayAmt ? 'Payout Shortage' : 'Excess Bank Credit';
+        rootCause = `${direction}: Unresolved ₹${diff.toFixed(2)} discrepancy between Gateway and Bank Credit`;
+      }
+      return { ...txn, gatewayAmt, bankAmt, mdrFee, status, rootCause };
+    }
+
+    function diagnoseTxn(txn) {
+      const gap = money(txn.gatewayAmt - txn.bankAmt);
+      if (gap < 0) {
+        return `Automated Engine: Bank credited ₹${Math.abs(gap).toFixed(2)} more than gateway payout (Duplicate Credit / Reversal Pending)`;
+      }
+      const beyondMdr = money(gap - txn.mdrFee);
+      if (beyondMdr > 0) {
+        return `Automated Engine: Detected ₹${gap.toFixed(2)} hold, of which ₹${beyondMdr.toFixed(2)} exceeds MDR (Chargeback Reserve / Processing Delay)`;
+      }
+      return `Automated Engine: Detected ₹${gap.toFixed(2)} hold (Chargeback Reserve / Processing Delay)`;
+    }
+
+    // Same 50 demo rows the Spring Boot DataSeeder writes to the database
+    function buildSampleDataset() {
+      const rows = [];
+      for (let i = 0; i < 50; i++) {
+        const gatewayAmt = 1000 + i * 147.5;
+        const mdr = money(gatewayAmt * MDR_RATE);
+        let bankAmt;
+        if (i % 5 === 0) bankAmt = gatewayAmt - 450;
+        else if (i % 3 === 0) bankAmt = gatewayAmt - mdr;
+        else bankAmt = gatewayAmt;
+        rows.push(classifyTxn({ id: `pay_RZP${100049 + i}`, utr: `UTR${889000 + i}`, gatewayAmt, bankAmt }));
+      }
+      return rows;
+    }
+
+    const OVERRIDE_NOTES = {
+      CHARGEBACK_FILED: 'Manually Resolved: Flagged for Chargeback Dispute',
+      FEE_TOLERANCE_APPROVED: 'Manually Resolved: Approved Gateway Fee Exception',
+      RESOLVED_MANUAL: 'Manually Resolved: Accepted Bank Clearing Adjustment'
+    };
+
+    // Theme Toggle Handler
+    function initTheme() {
+      const savedTheme = localStorage.getItem('theme') || 'light';
+      if (savedTheme === 'dark') {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
+      updateThemeIcons();
+    }
+
+    function toggleTheme() {
+      if (document.documentElement.classList.contains('dark')) {
+        document.documentElement.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
+      } else {
+        document.documentElement.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+      }
+      updateThemeIcons();
+    }
+
+    function updateThemeIcons() {
+      const isDark = document.documentElement.classList.contains('dark');
+      document.querySelectorAll('.theme-icon').forEach(icon => {
+        icon.setAttribute('data-lucide', isDark ? 'sun' : 'moon');
+      });
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+
+    // Load Database Records Automatically or Manually
+    async function initializeDataManual() {
+      const btn = document.getElementById('btn-manual-load');
+      if (btn) btn.innerHTML = `<i data-lucide="loader" class="w-4 h-4 animate-spin"></i><span>Querying SQL Ledger...</span>`;
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+
+      try {
+        const result = await apiRequest('/reconcile/transactions');
+        if (result && result.ok && Array.isArray(result.data)) {
+          dataset = result.data;
+          showNotification('SQL Database Ledger Synced Successfully!', 'success');
+        } else {
+          dataset = buildSampleDataset();
+          showNotification('Demo mode: loaded sample ledger (backend not connected).', 'success');
+        }
+        isDataLoaded = true;
+      } finally {
+        if (btn) {
+          btn.innerHTML = `<i data-lucide="database" class="w-4 h-4 text-emerald-500 dark:text-emerald-400"></i><span>SQL Ledger (${dataset.length} Recs)</span>`;
+          btn.className = "px-4 py-2.5 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-300 dark:border-emerald-700/50 text-emerald-700 dark:text-emerald-300 text-xs font-bold rounded-xl transition-all shadow-sm flex items-center gap-2 whitespace-nowrap";
+        }
+        updateLedgerStatusBadge();
+        renderTable();
+        updateMetrics();
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+      }
+    }
+
+    function updateLedgerStatusBadge() {
+      const badge = document.getElementById('ledger-status-badge');
+      if (!badge) return;
+      if (isDataLoaded && dataset.length > 0) {
+        badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 text-xs font-mono font-medium";
+        badge.innerHTML = `<div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div><span>${dataset.length} Records Connected</span>`;
+      } else {
+        badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs font-mono font-medium";
+        badge.innerHTML = `<div class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div><span>Ledger Offline (Click Load Data)</span>`;
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      initTheme();
+      fetchLiveForexRates();
+      initializeDataManual();
+    });
+
+    async function handleFileSelect(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      document.getElementById('file-name-display').innerText = file.name;
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const result = await apiRequest('/reconcile/upload', { method: 'POST', body: formData });
+      if (result && result.ok && Array.isArray(result.data)) {
+        dataset = result.data;
+        isDataLoaded = true;
+        updateLedgerStatusBadge();
+        renderTable();
+        updateMetrics();
+        showNotification('CSV Stream Ingested Successfully!', 'success');
+        return;
+      }
+      if (result && !result.ok) {
+        showNotification(result.data.message || 'CSV upload rejected by server.', 'error');
+        return;
+      }
+
+      if (typeof Papa === 'undefined') {
+        showNotification('CSV parser failed to load. Check your internet connection.', 'error');
+        return;
+      }
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: function(results) {
+          const rows = (results.data || []).map((row, idx) => {
+            const gatewayAmt = parseFloat(row.gatewayAmt || row['Gateway Amount'] || row.amount);
+            const bankAmt = parseFloat(row.bankAmt || row['Bank Credit'] || row.bank_amount || gatewayAmt);
+            if (isNaN(gatewayAmt) || isNaN(bankAmt)) return null;
+            return classifyTxn({
+              id: (row.id || row['Transaction ID'] || `pay_CSV${1000 + idx}`).trim(),
+              utr: (row.utr || row['UTR'] || `UTR${889000 + idx}`).trim(),
+              gatewayAmt,
+              bankAmt
+            });
+          }).filter(Boolean);
+
+          if (rows.length === 0) {
+            showNotification('No valid rows found in CSV.', 'error');
+            return;
+          }
+          dataset = rows;
+          isDataLoaded = true;
+          selectedTxnIds.clear();
+          updateBatchBar();
+          updateLedgerStatusBadge();
+          renderTable();
+          updateMetrics();
+          showNotification(`CSV parsed in browser: ${rows.length} records.`, 'success');
+        },
+        error: function() {
+          showNotification('Could not read CSV file.', 'error');
+        }
+      });
+    }
+
+    async function runReconciliation() {
+      if (!isDataLoaded || dataset.length === 0) {
+        showNotification('Please load dataset manually or upload a CSV first.', 'error');
+        return;
+      }
+      const btn = document.getElementById('btn-run');
+      btn.innerHTML = `<i data-lucide="loader" class="w-4 h-4 animate-spin"></i><span>Running AI Engine...</span>`;
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+
+      try {
+        const result = await apiRequest('/reconcile/run', { method: 'POST' });
+        if (result && result.ok && Array.isArray(result.data)) {
+          dataset = result.data;
+        } else {
+          dataset = dataset.map(txn => {
+            if (txn.status !== 'UNRESOLVED_EXCEPTION') return txn;
+            return { ...txn, rootCause: diagnoseTxn(txn) };
+          });
+        }
+        showNotification('AI matcher run complete.', 'success');
+      } finally {
+        renderTable();
+        updateMetrics();
+        btn.innerHTML = `<i data-lucide="cpu" class="w-4 h-4"></i><span>Run AI Matcher</span>`;
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+      }
+    }
+
+    async function handleAuth(event, type) {
+      event.preventDefault();
+      const email = type === 'login' ? document.getElementById('login-email').value : document.getElementById('reg-email').value;
+      const password = type === 'login' ? document.getElementById('login-password').value : document.getElementById('reg-password').value;
+
+      const name = type === 'register' ? (document.getElementById('reg-name')?.value || '') : undefined;
+
+      const result = await apiRequest(`/auth/${type === 'register' ? 'register' : 'login'}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, password })
+      });
+
+      // No backend (static hosting) -> demo mode, let the user straight in
+      if (!result || result.data.success) {
+        if (result) {
+          try { localStorage.setItem('auth_token', result.data.token); } catch (_) {}
+        }
+        closeAuthModal();
+        triggerWorkspaceLaunch();
+      } else {
+        showNotification(result.data.message || 'Invalid credentials.', 'error');
+      }
+    }
+
+    async function fetchLiveForexRates() {
+      try {
+        const res = await fetch('https://open.er-api.com/v6/latest/USD');
+        const data = await res.json();
+        if (data && data.rates && data.rates.INR) {
+          const usdToInr = data.rates.INR;
+          liveForexRates = {
+            USD: usdToInr,
+            EUR: usdToInr * (1 / data.rates.EUR),
+            GBP: usdToInr * (1 / data.rates.GBP),
+            AUD: usdToInr * (1 / data.rates.AUD)
+          };
+        }
+      } catch (e) {}
+    }
+
+    function convertCurrency() {
+      const amt = parseFloat(document.getElementById('conv-amount').value) || 0;
+      const curr = document.getElementById('conv-currency').value;
+      const rate = liveForexRates[curr] || 83.45;
+      const converted = amt * rate;
+      
+      document.getElementById('conv-output').innerText = `${amt.toLocaleString()} ${curr} = ₹${converted.toLocaleString(undefined, {minimumFractionDigits: 2})} INR`;
+      document.getElementById('conv-result').classList.remove('hidden');
+    }
+
+    function renderTable() {
+      const searchVal = (document.getElementById('search-input')?.value || '').toLowerCase();
+      const tbody = document.getElementById('table-body');
+      if (!tbody) return;
+
+      if (!dataset || dataset.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="7" class="py-12 text-center text-slate-500 font-mono text-xs">
+              <i data-lucide="database-backup" class="w-8 h-8 mx-auto mb-2 text-slate-400 dark:text-slate-600"></i>
+              No transactions loaded in memory.<br/>
+              Click <span class="text-blue-600 font-bold">"Load Data"</span> above to query the SQL database.
+            </td>
+          </tr>
+        `;
+        if (typeof lucide !== 'undefined') lucide.createIcons();
+        return;
+      }
+      
+      const filtered = dataset.filter(d => {
+        const matchFilter = currentFilter === 'ALL' || d.status === currentFilter;
+        const matchSearch = (d.id || '').toLowerCase().includes(searchVal) || (d.utr || '').toLowerCase().includes(searchVal);
+        return matchFilter && matchSearch;
+      });
+
+      tbody.innerHTML = filtered.map(d => `
+        <tr class="hover:bg-slate-50 dark:hover:bg-slate-900/80 transition-colors border-t border-slate-200 dark:border-slate-800">
+          <td class="py-3.5 px-4"><input type="checkbox" value="${d.id}" ${selectedTxnIds.has(d.id) ? 'checked' : ''} class="txn-checkbox rounded bg-slate-100 dark:bg-slate-900 border-slate-300 dark:border-slate-700 focus:ring-0" onchange="toggleSelectTxn('${d.id}', this)"></td>
+          <td class="py-3.5 px-6 font-mono font-medium text-slate-800 dark:text-slate-200">${d.id}</td>
+          <td class="py-3.5 px-6 font-mono text-slate-700 dark:text-slate-300">₹${d.gatewayAmt.toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+          <td class="py-3.5 px-6 font-mono text-slate-700 dark:text-slate-300">₹${d.bankAmt.toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+          <td class="py-3.5 px-6">${getStatusBadge(d.status)}</td>
+          <td class="py-3.5 px-6 text-slate-500 dark:text-slate-400 text-xs">${d.rootCause}</td>
+          <td class="py-3.5 px-6 text-right flex items-center justify-end gap-2">
+            <button onclick="inspectAgentReasoning('${d.id}')" class="p-1.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded-lg border border-slate-200 dark:border-slate-700 transition-colors" title="Inspect Log"><i data-lucide="bot" class="w-3.5 h-3.5"></i></button>
+            ${d.status === 'UNRESOLVED_EXCEPTION' 
+              ? `<button onclick="openModal('${d.id}')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 hover:bg-blue-600 hover:text-white font-bold rounded-lg border border-blue-200 dark:border-blue-800 transition-all text-[11px]">REVIEW</button>` 
+              : `<span class="text-slate-400 dark:text-slate-600 font-mono">—</span>`}
+          </td>
+        </tr>
+      `).join('');
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+
+    function toggleSelectAll(masterCb) {
+      selectedTxnIds.clear();
+      document.querySelectorAll('.txn-checkbox').forEach(cb => {
+        cb.checked = masterCb.checked;
+        if (masterCb.checked) selectedTxnIds.add(cb.value);
+      });
+      updateBatchBar();
+    }
+
+    function toggleSelectTxn(id, cb) {
+      if (cb.checked) selectedTxnIds.add(id);
+      else selectedTxnIds.delete(id);
+      updateBatchBar();
+    }
+
+    function updateBatchBar() {
+      const bar = document.getElementById('batch-action-bar');
+      const count = document.getElementById('selected-count');
+      if (selectedTxnIds.size > 0) {
+        bar.classList.remove('hidden');
+        count.innerText = selectedTxnIds.size;
+      } else {
+        bar.classList.add('hidden');
+      }
+    }
+
+    async function bulkApproveMdr() {
+      const idsToApprove = Array.from(selectedTxnIds);
+      const result = await apiRequest('/reconcile/bulk-approve-mdr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(idsToApprove)
+      });
+      if (result && result.ok && Array.isArray(result.data)) {
+        dataset = result.data;
+      } else {
+        dataset.forEach(d => {
+          if (selectedTxnIds.has(d.id) && d.status === 'UNRESOLVED_EXCEPTION') {
+            d.status = 'PARTIAL_MATCH';
+            d.rootCause = 'Bulk Approved: MDR Rate Variance Accepted by Controller';
+          }
+        });
+      }
+
+      selectedTxnIds.clear();
+      renderTable();
+      updateMetrics();
+      updateBatchBar();
+      showNotification('Selected items bulk approved.', 'success');
+    }
+
+    function exportAuditTrailCSV() {
+      if (dataset.length === 0) {
+        showNotification('No data available to export.', 'error');
+        return;
+      }
+      const headers = "Transaction ID,UTR,Gateway Amount (INR),Bank Credit (INR),MDR Fee (INR),Status,AI Confidence,Timestamp,Diagnosis Reasoning Log\n";
+      const rows = dataset.map(e => {
+        const timestamp = new Date().toISOString();
+        const confidence = e.status === 'EXACT_MATCH' ? '99.9%' : e.status === 'PARTIAL_MATCH' ? '98.5%' : '91.4%';
+        const cleanReason = `"${(e.rootCause || '').replace(/"/g, '""')}"`;
+        return `${e.id},${e.utr},${e.gatewayAmt},${e.bankAmt},${e.mdrFee},${e.status},${confidence},${timestamp},${cleanReason}`;
+      }).join("\n");
+
+      const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.setAttribute("href", url);
+      link.setAttribute("download", `ReconEngine_Audit_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    async function applyOverride() {
+      if (!activeTxn) return;
+      const selectedAction = document.getElementById('override-action-select').value;
+
+      const result = await apiRequest('/reconcile/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: activeTxn.id, action: selectedAction })
+      });
+      if (result && result.ok && result.data && result.data.id) {
+        const idx = dataset.findIndex(d => d.id === result.data.id);
+        if (idx !== -1) dataset[idx] = result.data;
+      } else {
+        activeTxn.status = 'RESOLVED_MANUAL';
+        activeTxn.rootCause = OVERRIDE_NOTES[selectedAction] || OVERRIDE_NOTES.RESOLVED_MANUAL;
+      }
+
+      renderTable();
+      updateMetrics();
+      closeModal();
+      showNotification('Manual resolution applied.', 'success');
+    }
+
+    function getStatusBadge(status) {
+      if (status === 'EXACT_MATCH') return `<span class="px-2.5 py-1 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 border border-emerald-300 dark:border-emerald-800 rounded-lg font-bold text-[10px] tracking-wide">MATCHED</span>`;
+      if (status === 'PARTIAL_MATCH') return `<span class="px-2.5 py-1 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400 border border-blue-300 dark:border-blue-800 rounded-lg font-bold text-[10px] tracking-wide">FEE VARIANCE</span>`;
+      if (status === 'RESOLVED_MANUAL') return `<span class="px-2.5 py-1 bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-400 border border-purple-300 dark:border-purple-800 rounded-lg font-bold text-[10px] tracking-wide">MANUAL FIX</span>`;
+      return `<span class="px-2.5 py-1 bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 border border-amber-300 dark:border-amber-800 rounded-lg font-bold text-[10px] tracking-wide">EXCEPTION</span>`;
+    }
+
+    function setFilter(filter) {
+      currentFilter = filter;
+      ['ALL', 'EXACT_MATCH', 'PARTIAL_MATCH', 'UNRESOLVED_EXCEPTION'].forEach(f => {
+        const el = document.getElementById(`filter-${f}`);
+        if (el) {
+          el.className = f === filter 
+            ? "px-3.5 py-1.5 text-xs font-bold rounded-lg text-white bg-blue-600 transition-all whitespace-nowrap shadow-sm"
+            : "px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all whitespace-nowrap bg-transparent";
+        }
+      });
+      renderTable();
+    }
+
+    function triggerWorkspaceLaunch() {
+      const overlay = document.getElementById('launch-overlay');
+      const progressBar = document.getElementById('launch-progress-bar');
+      const statusText = document.getElementById('launch-status-text');
+
+      overlay.classList.remove('hidden');
+
+      const steps = [
+        { progress: '25%', text: 'Initializing Ingestion Engine...' },
+        { progress: '60%', text: 'Connecting to SQL Database & Ledger Feeds...' },
+        { progress: '90%', text: 'Running AI Multi-Source Matching Loop...' },
+        { progress: '100%', text: 'ReconEngine Workspace Ready.' }
+      ];
+
+      steps.forEach((step, index) => {
+        setTimeout(() => {
+          progressBar.style.width = step.progress;
+          statusText.innerText = step.text;
+        }, (index + 1) * 350);
+      });
+
+      setTimeout(() => {
+        overlay.classList.add('opacity-0');
+        setTimeout(() => {
+          overlay.classList.add('hidden');
+          overlay.classList.remove('opacity-0');
+          progressBar.style.width = '0%';
+          document.getElementById('home-screen').classList.add('hidden');
+          const dash = document.getElementById('dashboard-screen');
+          dash.classList.remove('hidden');
+          dash.classList.add('flex');
+          window.scrollTo(0, 0);
+          if (typeof lucide !== 'undefined') lucide.createIcons();
+        }, 400);
+      }, 1700);
+    }
+
+    function showAuthModal(mode) {
+      document.getElementById('auth-modal').classList.remove('hidden');
+      switchAuthMode(mode);
+    }
+
+    function closeAuthModal() {
+      document.getElementById('auth-modal').classList.add('hidden');
+    }
+
+    function switchAuthMode(mode) {
+      const loginForm = document.getElementById('form-login');
+      const registerForm = document.getElementById('form-register');
+      const forgotForm = document.getElementById('form-forgot');
+      const tabLogin = document.getElementById('tab-login');
+      const tabRegister = document.getElementById('tab-register');
+      const tabsContainer = document.getElementById('auth-tabs');
+
+      loginForm.classList.add('hidden');
+      registerForm.classList.add('hidden');
+      forgotForm.classList.add('hidden');
+
+      if (mode === 'login') {
+        tabsContainer.classList.remove('hidden');
+        loginForm.classList.remove('hidden');
+        tabLogin.className = "flex-1 py-3 text-sm font-bold rounded-xl transition-all text-white bg-blue-600 shadow-sm";
+        tabRegister.className = "flex-1 py-3 text-sm font-bold rounded-xl transition-all text-slate-500 hover:text-slate-900";
+      } else if (mode === 'register') {
+        tabsContainer.classList.remove('hidden');
+        registerForm.classList.remove('hidden');
+        tabRegister.className = "flex-1 py-3 text-sm font-bold rounded-xl transition-all text-white bg-blue-600 shadow-sm";
+        tabLogin.className = "flex-1 py-3 text-sm font-bold rounded-xl transition-all text-slate-500 hover:text-slate-900";
+      } else if (mode === 'forgot') {
+        tabsContainer.classList.add('hidden');
+        forgotForm.classList.remove('hidden');
+      }
+    }
+
+    function switchDashboardTab(tabId) {
+      const tabs = ['recon', 'banking', 'tax', 'converter'];
+      tabs.forEach(t => {
+        const content = document.getElementById(`tab-content-${t}`);
+        const navBtn = document.getElementById(`nav-tab-${t}`);
+        if (content) content.classList.add('hidden');
+        if (navBtn) navBtn.className = "px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all flex items-center gap-1.5";
+      });
+
+      const activeContent = document.getElementById(`tab-content-${tabId}`);
+      const activeNav = document.getElementById(`nav-tab-${tabId}`);
+      if (activeContent) activeContent.classList.remove('hidden');
+      if (activeNav) activeNav.className = "px-3.5 py-1.5 text-xs font-bold rounded-lg text-white bg-blue-600 transition-all flex items-center gap-1.5 shadow-sm";
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+
+    function openModal(id) {
+      activeTxn = dataset.find(d => d.id === id);
+      if (!activeTxn) return;
+      
+      document.getElementById('modal-txn-id').innerText = `Txn ID: ${activeTxn.id}`;
+      document.getElementById('modal-source-rzp').innerText = `₹${activeTxn.gatewayAmt.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      document.getElementById('modal-source-ledger').innerText = `₹${activeTxn.gatewayAmt.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      document.getElementById('modal-source-bank').innerText = `₹${activeTxn.bankAmt.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      
+      const diff = (activeTxn.gatewayAmt - activeTxn.bankAmt).toFixed(2);
+      document.getElementById('modal-diagnosis-text').innerText = `System identified a ₹${diff} payout mismatch between Bank Credit and internal expected amount.`;
+      
+      document.getElementById('modal-override').classList.remove('hidden');
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+
+    function closeModal() {
+      document.getElementById('modal-override').classList.add('hidden');
+      activeTxn = null;
+    }
+
+    function inspectAgentReasoning(txnId) {
+      const txn = dataset.find(d => d.id === txnId);
+      if (!txn) return;
+
+      document.getElementById('drawer-txn-id').innerText = `Txn ID: ${txn.id}`;
+      const container = document.getElementById('drawer-logs');
+      
+      const diff = (txn.gatewayAmt - txn.bankAmt).toFixed(2);
+      const steps = [
+        { time: '00:00.12', title: 'Step 1: Extracted Gateway Settlement', detail: `Gateway Amount: ₹${txn.gatewayAmt.toFixed(2)} | UTR: ${txn.utr}` },
+        { time: '00:00.45', title: 'Step 2: Escrow Ledger Query', detail: `Received Credit in Bank Escrow: ₹${txn.bankAmt.toFixed(2)}` },
+        { time: '00:00.89', title: 'Step 3: Variance Calculation', detail: `Computed Delta: ₹${diff} (MDR Fee Expected: ₹${txn.mdrFee.toFixed(2)})` },
+        { time: '00:01.32', title: 'Step 4: Reasoning Chain', detail: `${txn.rootCause}` },
+        { time: '00:01.85', title: 'Step 5: Final Decision', detail: `Confidence Score: ${txn.status === 'EXACT_MATCH' ? '99.9%' : '94.2%'} → State: ${txn.status}` }
+      ];
+
+      container.innerHTML = steps.map(s => `
+        <div class="p-3 bg-slate-100 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl space-y-1">
+          <div class="text-blue-600 dark:text-blue-400 font-bold flex items-center justify-between">
+            <span>${s.title}</span>
+            <span class="text-[10px] text-slate-500">${s.time}</span>
+          </div>
+          <div class="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed">${s.detail}</div>
+        </div>
+      `).join('');
+
+      document.getElementById('drawer-agent').classList.remove('translate-x-full');
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+
+    function closeAgentDrawer() {
+      document.getElementById('drawer-agent').classList.add('translate-x-full');
+    }
+
+    function validateBankingCode() {
+      const input = document.getElementById('banking-input').value.trim();
+      const res = document.getElementById('banking-result');
+      if (input.length >= 4) {
+        res.classList.remove('hidden');
+      } else {
+        res.classList.add('hidden');
+      }
+    }
+
+    function calculateTaxMDR() {
+      const amt = parseFloat(document.getElementById('tax-amount').value) || 0;
+      const rate = parseFloat(document.getElementById('tax-rate').value) || 0;
+      
+      const fee = amt * (rate / 100);
+      const gst = fee * 0.18;
+      const net = amt - fee - gst;
+      
+      document.getElementById('res-gross').innerText = `Gross Amount: ₹${amt.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      document.getElementById('res-fee').innerText = `MDR Fee (${rate}%): ₹${fee.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      document.getElementById('res-gst').innerText = `GST on MDR (18%): ₹${gst.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      document.getElementById('res-net').innerText = `Net Expected Payout: ₹${net.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+      
+      document.getElementById('tax-result').classList.remove('hidden');
+    }
+
+    function handleForgotPassword(event) {
+      event.preventDefault();
+      alert('Password reset link sent to your work email.');
+      switchAuthMode('login');
+    }
+
+    function logout() {
+      document.getElementById('dashboard-screen').classList.add('hidden');
+      document.getElementById('dashboard-screen').classList.remove('flex');
+      document.getElementById('home-screen').classList.remove('hidden');
+      window.scrollTo(0, 0);
+    }
+
+    function updateMetrics() {
+      const totalCount = dataset.length;
+      document.getElementById('metric-total').innerText = totalCount;
+      
+      const exactCount = dataset.filter(d => d.status === 'EXACT_MATCH' || d.status === 'RESOLVED_MANUAL').length;
+      const accuracy = totalCount > 0 ? Math.round((exactCount / totalCount) * 100) : 0;
+      document.getElementById('metric-accuracy').innerText = `${accuracy}%`;
+      document.getElementById('bar-accuracy').style.width = `${accuracy}%`;
+
+      const exceptions = dataset.filter(d => d.status === 'UNRESOLVED_EXCEPTION').length;
+      document.getElementById('metric-exceptions').innerText = exceptions;
+      document.getElementById('bar-exceptions').style.width = `${totalCount > 0 ? (exceptions / totalCount) * 100 : 0}%`;
+
+      const totalVol = dataset.reduce((acc, curr) => acc + (curr.gatewayAmt || 0), 0);
+      document.getElementById('summary-total-vol').innerText = `₹${totalVol.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+    }
+
+    function showNotification(msg, type = 'info') {
+      const banner = document.getElementById('toast-notification');
+      if (!banner) return;
+      banner.innerText = msg;
+      banner.className = `fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl text-xs font-bold text-white shadow-xl transition-all duration-300 ${type === 'success' ? 'bg-emerald-600' : 'bg-rose-600'}`;
+      banner.classList.remove('hidden');
+      setTimeout(() => { banner.classList.add('hidden'); }, 3000);
+    }
+  </script>
+</head>
+
+<body class="h-full font-sans antialiased bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-200">
+
+  <!-- Toast Notification -->
+  <div id="toast-notification" class="hidden"></div>
+
+  <!-- Launching Overlay -->
+  <div id="launch-overlay" class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#02042B] text-white hidden transition-opacity duration-500">
+    <div class="relative flex items-center justify-center mb-8">
+      <div class="w-24 h-24 rounded-full bg-blue-600/20 border border-blue-500/30 pulse-ring absolute"></div>
+      <div class="w-16 h-16 rounded-2xl bg-blue-600 flex items-center justify-center shadow-xl shadow-blue-600/50 z-10">
+        <i data-lucide="layers" class="w-8 h-8 text-white animate-bounce"></i>
+      </div>
+    </div>
+    
+    <div class="text-center space-y-3 max-w-sm px-4">
+      <h3 class="text-xl font-bold tracking-tight text-white">Launching ReconEngine <span class="text-blue-400">AI</span></h3>
+      <p id="launch-status-text" class="text-xs font-mono text-slate-300">Initializing Stream Ingestion...</p>
+      
+      <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden border border-slate-700 mt-4">
+        <div id="launch-progress-bar" class="bg-blue-500 h-full w-0 transition-all duration-300 ease-out"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Auth Modal -->
+  <div id="auth-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-md hidden">
+    <div class="w-full max-w-md bg-white dark:bg-slate-900 rounded-[2rem] p-8 shadow-2xl relative border border-slate-200 dark:border-slate-800">
+      <button onclick="closeAuthModal()" class="absolute right-6 top-6 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 p-1">
+        <i data-lucide="x" class="w-6 h-6"></i>
+      </button>
+
+      <div class="flex items-center gap-4 mb-8">
+        <div class="w-12 h-12 rounded-xl bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-600/30">
+          <i data-lucide="layers" class="w-6 h-6 text-white"></i>
+        </div>
+        <div>
+          <h1 class="font-black text-2xl tracking-tight text-[#02042B] dark:text-white">ReconEngine <span class="text-blue-600">AI</span></h1>
+          <p class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mt-1">Razorpay Auth Portal</p>
+        </div>
+      </div>
+
+      <div id="auth-tabs" class="flex bg-slate-100 dark:bg-slate-800 p-1.5 rounded-2xl mb-8 border border-slate-200 dark:border-slate-700">
+        <button id="tab-login" type="button" onclick="switchAuthMode('login')" class="flex-1 py-3 text-sm font-bold rounded-xl transition-all text-white bg-blue-600 shadow-sm">Sign In</button>
+        <button id="tab-register" type="button" onclick="switchAuthMode('register')" class="flex-1 py-3 text-sm font-bold rounded-xl transition-all text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white">Register</button>
+      </div>
+
+      <form id="form-login" onsubmit="handleAuth(event, 'login')" class="space-y-5">
+        <div>
+          <label class="block text-sm font-bold text-slate-700 dark:text-slate-300 mb-2">Email Address</label>
+          <div class="relative">
+            <i data-lucide="mail" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="email" id="login-email" required value="admin@reconengine.com" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <label class="block text-sm font-bold text-slate-700 dark:text-slate-300">Password</label>
+            <button type="button" onclick="switchAuthMode('forgot')" class="text-xs font-bold text-blue-600 hover:underline">Forgot password?</button>
+          </div>
+          <div class="relative">
+            <i data-lucide="lock" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="password" id="login-password" required value="admin123" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <button type="submit" class="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-black text-sm rounded-xl transition-all shadow-lg shadow-blue-600/30 flex items-center justify-center gap-2 mt-8">
+          <span>Authenticate & Access Workspace</span>
+          <i data-lucide="arrow-right" class="w-5 h-5"></i>
+        </button>
+      </form>
+
+      <form id="form-register" onsubmit="handleAuth(event, 'register')" class="space-y-5 hidden">
+        <div>
+          <label class="block text-sm font-bold text-slate-700 dark:text-slate-300 mb-2">Full Name</label>
+          <div class="relative">
+            <i data-lucide="user" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="text" id="reg-name" required value="GHOST" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm font-bold text-slate-700 dark:text-slate-300 mb-2">Work Email</label>
+          <div class="relative">
+            <i data-lucide="mail" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="email" id="reg-email" required placeholder="Enter work email" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm font-bold text-slate-700 dark:text-slate-300 mb-2">Password</label>
+          <div class="relative">
+            <i data-lucide="lock" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="password" id="reg-password" required placeholder="Create password" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <button type="submit" class="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-black text-sm rounded-xl transition-all shadow-lg shadow-blue-600/30 flex items-center justify-center gap-2 mt-8">
+          <span>Create Account</span>
+          <i data-lucide="user-plus" class="w-5 h-5"></i>
+        </button>
+      </form>
+
+      <form id="form-forgot" onsubmit="handleForgotPassword(event)" class="space-y-5 hidden">
+        <div class="p-4 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl text-sm font-medium text-blue-800 dark:text-blue-300">
+          Enter your registered email address to receive secure recovery credentials.
+        </div>
+        <div>
+          <label class="block text-sm font-bold text-slate-700 dark:text-slate-300 mb-2">Email Address</label>
+          <div class="relative">
+            <i data-lucide="mail" class="w-5 h-5 absolute left-4 top-3.5 text-slate-400"></i>
+            <input type="email" id="forgot-email" required placeholder="Enter work email" class="w-full bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 rounded-xl pl-12 pr-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 transition-all">
+          </div>
+        </div>
+        <button type="submit" class="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-black text-sm rounded-xl transition-all shadow-lg shadow-blue-600/30 flex items-center justify-center gap-2 mt-6">
+          <span>Send Recovery Email</span>
+          <i data-lucide="send" class="w-5 h-5"></i>
+        </button>
+        <button type="button" onclick="switchAuthMode('login')" class="w-full text-sm font-bold text-slate-500 hover:text-slate-800 pt-3 text-center block">
+          &larr; Return to Sign In
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Agent Reasoning Side Drawer -->
+  <div id="drawer-agent" class="fixed inset-y-0 right-0 z-50 w-full max-w-md bg-white dark:bg-[#111] border-l border-slate-200 dark:border-slate-800 shadow-2xl transform translate-x-full transition-transform duration-300 flex flex-col">
+    <div class="p-5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-[#0a0a0a]">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-blue-100 dark:bg-blue-600/20 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/30 flex items-center justify-center">
+          <i data-lucide="bot" class="w-4 h-4"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-slate-900 dark:text-white text-sm">Agent Reasoning Chain</h3>
+          <p class="text-[10px] font-mono text-slate-500 dark:text-slate-400" id="drawer-txn-id">Txn: --</p>
+        </div>
+      </div>
+      <button onclick="closeAgentDrawer()" class="text-slate-400 hover:text-slate-700 dark:hover:text-white p-1">
+        <i data-lucide="x" class="w-5 h-5"></i>
+      </button>
+    </div>
+    <div id="drawer-logs" class="p-5 flex-1 overflow-y-auto space-y-3 font-mono text-xs"></div>
+  </div>
+
+  <!-- Override Modal -->
+  <div id="modal-override" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-md hidden">
+    <div class="w-full max-w-2xl bg-white dark:bg-[#111] rounded-3xl p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-6">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-xl bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-500 border border-amber-200 dark:border-amber-800 flex items-center justify-center">
+            <i data-lucide="sliders" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-sm text-slate-900 dark:text-white">Manual Variance Override Queue</h3>
+            <p class="text-xs font-mono text-slate-500 dark:text-slate-400" id="modal-txn-id">Txn ID: pay_O1a2B3c4D5</p>
+          </div>
+        </div>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600 p-1">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1">
+          <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Gateway Payout</span>
+          <p id="modal-source-rzp" class="font-mono font-bold text-sm text-slate-900 dark:text-white">₹5,000.00</p>
+          <span class="text-[10px] text-emerald-600 dark:text-emerald-500 font-bold">Captured</span>
+        </div>
+        <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1">
+          <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Bank Credit</span>
+          <p id="modal-source-bank" class="font-mono font-bold text-sm text-rose-600 dark:text-rose-500">₹4,500.00</p>
+          <span class="text-[10px] text-rose-600 dark:text-rose-500 font-bold">Variance Detected</span>
+        </div>
+        <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1">
+          <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500">Internal Ledger</span>
+          <p id="modal-source-ledger" class="font-mono font-bold text-sm text-slate-900 dark:text-white">₹5,000.00</p>
+          <span class="text-[10px] text-slate-500">Order #ord_1049</span>
+        </div>
+      </div>
+
+      <div class="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/50 rounded-xl text-xs text-amber-800 dark:text-amber-400 flex items-start gap-2">
+        <i data-lucide="info" class="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-500"></i>
+        <div id="modal-diagnosis-text">System identified a payout mismatch.</div>
+      </div>
+
+      <div class="space-y-2">
+        <label class="block text-xs font-bold text-slate-600 dark:text-slate-400">Resolution Classification Override</label>
+        <select id="override-action-select" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-300 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600">
+          <option value="RESOLVED_MANUAL">Settle Manually — Accept Bank Clearing Adjustment</option>
+          <option value="CHARGEBACK_FILED">Flag as Chargeback Dispute</option>
+          <option value="FEE_TOLERANCE_APPROVED">Approve Special Gateway Fee Exception</option>
+        </select>
+      </div>
+
+      <div class="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 dark:border-slate-800">
+        <button onclick="closeModal()" class="px-4 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-bold rounded-xl transition-colors">Cancel</button>
+        <button onclick="applyOverride()" class="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md flex items-center gap-2">
+          <i data-lucide="check-circle" class="w-4 h-4"></i>
+          <span>Apply Manual Override</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOME SCREEN -->
+  <div id="home-screen" class="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white relative z-10">
+    <header class="h-20 bg-[#02042B] border-b border-slate-800 sticky top-0 z-40 px-6 lg:px-12 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-600/40">
+          <i data-lucide="layers" class="w-6 h-6 text-white"></i>
+        </div>
+        <div>
+          <span class="font-extrabold text-lg tracking-tight text-white">ReconEngine <span class="text-blue-400">AI</span></span>
+          <span class="block text-[10px] text-blue-300 font-semibold tracking-wider uppercase">Razorpay Buildathon Track 4</span>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <!-- TOP RIGHT THEME TOGGLE BUTTON -->
+        <button onclick="toggleTheme()" class="p-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-blue-200 hover:text-white border border-white/10 transition-all flex items-center justify-center" title="Toggle Light/Dark Theme">
+          <i class="theme-icon w-4 h-4" data-lucide="moon"></i>
+        </button>
+
+        <button onclick="showAuthModal('login')" class="px-4 py-2 text-xs font-semibold text-slate-200 hover:text-white transition-colors rounded-lg hover:bg-white/5">
+          Sign In
+        </button>
+        <button onclick="showAuthModal('register')" class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-lg shadow-blue-600/30">
+          Get Started
+        </button>
+      </div>
+    </header>
+
+    <main class="flex-1 max-w-[1400px] w-full mx-auto px-6 lg:px-12">
+      <section class="min-h-[calc(100vh-80px)] grid grid-cols-1 lg:grid-cols-2 gap-16 items-center py-12">
+        <div class="space-y-8">
+          <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-blue-100 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-700/50 text-blue-700 dark:text-blue-300 text-sm font-semibold">
+            <i data-lucide="zap" class="w-4 h-4 text-blue-600 dark:text-blue-400"></i> Razorpay Buildathon Track 4 Submission
+          </div>
+          <h1 class="text-6xl lg:text-[5.25rem] font-black tracking-tighter text-[#02042B] dark:text-white leading-[1.05]">
+            Automated Multi-Source <span class="text-blue-600">Financial Reconciliation</span>
+          </h1>
+          <p class="text-slate-600 dark:text-slate-400 text-xl lg:text-2xl leading-relaxed font-medium">
+            Eliminate manual matching errors. Reconcile payment gateway payouts, bank settlement credits, and internal SQL books in real-time.
+          </p>
+          
+          <div class="flex flex-wrap gap-5 pt-4">
+            <button onclick="showAuthModal('login')" class="px-8 py-4 bg-blue-600 hover:bg-blue-500 text-white text-lg font-bold rounded-2xl transition-all shadow-xl shadow-blue-600/30 flex items-center gap-3">
+              <span>Launch Recon Workspace</span>
+              <i data-lucide="arrow-right" class="w-5 h-5"></i>
+            </button>
+            <a href="#features" class="px-8 py-4 bg-white dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-200 text-lg font-bold rounded-2xl transition-all shadow-sm">
+              Explore Suite Features
+            </a>
+          </div>
+        </div>
+
+        <div class="bg-white dark:bg-[#0b0f19] p-10 rounded-[2rem] border-2 border-slate-200 dark:border-slate-800 relative overflow-hidden space-y-8 lg:scale-105 rzp-glow">
+          <div class="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-6">
+            <div class="flex items-center gap-4">
+              <div class="w-12 h-12 rounded-xl bg-blue-50 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 flex items-center justify-center border border-blue-200 dark:border-blue-800">
+                <i data-lucide="shield-check" class="w-6 h-6"></i>
+              </div>
+              <div>
+                <h4 class="font-extrabold text-base text-slate-900 dark:text-white uppercase tracking-wide">Live Settlement Ingestion</h4>
+                <p class="text-sm font-semibold text-slate-500 dark:text-slate-400">Automated Stream Processing</p>
+              </div>
+            </div>
+            <span class="px-4 py-1.5 rounded-full text-xs font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">SQL Connected</span>
+          </div>
+
+          <div class="grid grid-cols-2 gap-6">
+            <div class="p-6 rounded-2xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 space-y-2">
+              <span class="text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">Target Volume</span>
+              <p class="text-3xl font-black text-slate-900 dark:text-white">5,000 Rec/s</p>
+            </div>
+            <div class="p-6 rounded-2xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 space-y-2">
+              <span class="text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">Target Accuracy</span>
+              <p class="text-3xl font-black text-emerald-600 dark:text-emerald-400">99.9% Match</p>
+            </div>
+          </div>
+
+          <div class="p-6 rounded-2xl bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900/50 flex flex-col gap-3">
+            <div class="flex items-center justify-between text-blue-700 dark:text-blue-300">
+              <div class="flex items-center gap-3">
+                <i data-lucide="cpu" class="w-6 h-6 text-blue-600 dark:text-blue-400"></i>
+                <span class="font-bold text-lg">Stream Ingestion Engine</span>
+              </div>
+              <span class="font-mono font-black text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-3 py-1 rounded-lg border border-blue-300 dark:border-blue-800">Active</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="features" class="min-h-screen flex flex-col justify-center space-y-16 py-20 relative z-10">
+        <div class="text-center space-y-6 max-w-4xl mx-auto">
+          <h2 class="text-5xl lg:text-7xl font-black text-[#02042B] dark:text-white tracking-tight">Enterprise Fintech Toolsuite</h2>
+          <p class="text-slate-600 dark:text-slate-400 text-xl lg:text-2xl font-medium leading-relaxed">Built specifically for high-volume automated clearing and payout auditability.</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+          <div class="bg-white dark:bg-[#0b0f19] p-8 rounded-[2rem] border border-slate-200 dark:border-slate-800 space-y-5 hover:border-blue-500 transition-all hover:-translate-y-2 cursor-pointer shadow-md">
+            <div class="w-14 h-14 rounded-2xl bg-blue-50 dark:bg-blue-950 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800 flex items-center justify-center">
+              <i data-lucide="cpu" class="w-7 h-7"></i>
+            </div>
+            <h3 class="font-black text-slate-900 dark:text-white text-xl">Reconciliation Engine</h3>
+            <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed font-medium">Cross-verify gateway payouts with bank statement credits and ledger entries with multi-source matching algorithms.</p>
+          </div>
+
+          <div class="bg-white dark:bg-[#0b0f19] p-8 rounded-[2rem] border border-slate-200 dark:border-slate-800 space-y-5 hover:border-indigo-500 transition-all hover:-translate-y-2 cursor-pointer shadow-md">
+            <div class="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800 flex items-center justify-center">
+              <i data-lucide="landmark" class="w-7 h-7"></i>
+            </div>
+            <h3 class="font-black text-slate-900 dark:text-white text-xl">Banking Tools</h3>
+            <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed font-medium">Validate UTR reference numbers, IFSC routing parameters, and virtual account clearing states instantly.</p>
+          </div>
+
+          <div class="bg-white dark:bg-[#0b0f19] p-8 rounded-[2rem] border border-slate-200 dark:border-slate-800 space-y-5 hover:border-emerald-500 transition-all hover:-translate-y-2 cursor-pointer shadow-md">
+            <div class="w-14 h-14 rounded-2xl bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 flex items-center justify-center">
+              <i data-lucide="calculator" class="w-7 h-7"></i>
+            </div>
+            <h3 class="font-black text-slate-900 dark:text-white text-xl">Tax & MDR Calculator</h3>
+            <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed font-medium">Compute merchant discount rates (MDR), GST breakdowns, and net payout variances across payment methods.</p>
+          </div>
+
+          <div class="bg-white dark:bg-[#0b0f19] p-8 rounded-[2rem] border border-slate-200 dark:border-slate-800 space-y-5 hover:border-amber-500 transition-all hover:-translate-y-2 cursor-pointer shadow-md">
+            <div class="w-14 h-14 rounded-2xl bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800 flex items-center justify-center">
+              <i data-lucide="repeat" class="w-7 h-7"></i>
+            </div>
+            <h3 class="font-black text-slate-900 dark:text-white text-xl">Money Converter</h3>
+            <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed font-medium">Convert cross-border payout amounts for international settlements with dynamic forex rate feeds.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- DASHBOARD SCREEN -->
+  <div id="dashboard-screen" class="min-h-screen flex-col hidden bg-slate-50 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 relative z-10">
+    <header class="h-16 bg-white dark:bg-[#050505] border-b border-slate-200 dark:border-slate-800 sticky top-0 z-30 px-6 flex items-center justify-between">
+      <div class="flex items-center gap-6">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-600/30">
+            <i data-lucide="layers" class="w-5 h-5 text-white"></i>
+          </div>
+          <div>
+            <span class="font-black text-base text-slate-900 dark:text-white tracking-tight">ReconEngine <span class="text-blue-600">AI</span></span>
+            <span class="ml-2 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border border-emerald-300 dark:border-emerald-500/30">Track 4 Active</span>
+          </div>
+        </div>
+
+        <nav class="hidden md:flex items-center gap-1 bg-slate-100 dark:bg-[#111] p-1 rounded-xl border border-slate-200 dark:border-slate-800">
+          <button onclick="switchDashboardTab('recon')" id="nav-tab-recon" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-white bg-blue-600 transition-all flex items-center gap-1.5 shadow-sm">
+            <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Reconciliation
+          </button>
+          <button onclick="switchDashboardTab('banking')" id="nav-tab-banking" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all flex items-center gap-1.5">
+            <i data-lucide="landmark" class="w-3.5 h-3.5"></i> Banking Tools
+          </button>
+          <button onclick="switchDashboardTab('tax')" id="nav-tab-tax" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all flex items-center gap-1.5">
+            <i data-lucide="calculator" class="w-3.5 h-3.5"></i> Tax Calculator
+          </button>
+          <button onclick="switchDashboardTab('converter')" id="nav-tab-converter" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all flex items-center gap-1.5">
+            <i data-lucide="repeat" class="w-3.5 h-3.5"></i> Money Converter
+          </button>
+        </nav>
+      </div>
+
+      <div class="flex items-center gap-4">
+        <div id="ledger-status-badge" class="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs font-mono font-medium">
+          <div class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
+          <span>Connecting SQL...</span>
+        </div>
+        
+        <div class="h-4 w-[1px] bg-slate-200 dark:bg-slate-800 hidden sm:block"></div>
+
+        <!-- DASHBOARD THEME TOGGLE BUTTON -->
+        <button onclick="toggleTheme()" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors flex items-center justify-center" title="Toggle Light/Dark Theme">
+          <i class="theme-icon w-4 h-4" data-lucide="moon"></i>
+        </button>
+
+        <div class="flex items-center gap-2.5">
+          <div class="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-400 border border-blue-300 dark:border-blue-800 flex items-center justify-center font-bold text-xs">G</div>
+          <span class="text-xs font-bold text-slate-800 dark:text-slate-200">GHOST</span>
+        </div>
+        <button onclick="logout()" class="p-2 text-slate-400 hover:text-rose-600 transition-colors rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800" title="Logout">
+          <i data-lucide="log-out" class="w-4 h-4"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="flex-1 max-w-[1400px] w-full mx-auto px-6 py-8 space-y-8">
+      
+      <!-- RECON WORKSPACE TAB -->
+      <div id="tab-content-recon" class="space-y-8">
+        
+        <!-- Cash Flow Forecasting Widget -->
+        <div class="bg-white dark:bg-[#111] p-5 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-4 shadow-sm">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <i data-lucide="trending-up" class="w-4 h-4 text-emerald-600 dark:text-emerald-400"></i>
+              <h3 class="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">30-Day Cash Flow Forecasting</h3>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="text-xs text-slate-500 dark:text-slate-400 font-mono">Loaded Vol: <strong id="summary-total-vol" class="text-slate-900 dark:text-white">₹0.00</strong></span>
+              <span class="text-xs font-mono font-bold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-3 py-1.5 rounded-xl border border-emerald-200 dark:border-emerald-800/50">+₹14,250,000.00 Expected</span>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-1">
+            <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-center"><span class="block text-[10px] text-slate-500 font-bold uppercase">Week 1</span><span class="text-xs font-mono text-slate-900 dark:text-white font-bold">₹3,200,000</span></div>
+            <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-center"><span class="block text-[10px] text-slate-500 font-bold uppercase">Week 2</span><span class="text-xs font-mono text-slate-900 dark:text-white font-bold">₹3,800,000</span></div>
+            <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-center"><span class="block text-[10px] text-slate-500 font-bold uppercase">Week 3</span><span class="text-xs font-mono text-slate-900 dark:text-white font-bold">₹3,400,000</span></div>
+            <div class="bg-slate-50 dark:bg-[#0a0a0a] p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-center"><span class="block text-[10px] text-slate-500 font-bold uppercase">Week 4</span><span class="text-xs font-mono text-slate-900 dark:text-white font-bold">₹3,850,000</span></div>
+            <div class="bg-blue-50 dark:bg-blue-950/20 p-3 rounded-xl border border-blue-200 dark:border-blue-900/50 text-center col-span-2 sm:col-span-1"><span class="block text-[10px] text-blue-600 dark:text-blue-400 font-bold uppercase">Net Forecast</span><span class="text-xs font-mono text-blue-700 dark:text-blue-300 font-bold">₹14,250,000</span></div>
+          </div>
+        </div>
+
+        <!-- Ingestion Panel -->
+        <section class="bg-white dark:bg-[#111] p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+            <div class="space-y-1 text-center md:text-left">
+              <h2 class="text-base font-bold text-slate-900 dark:text-white flex items-center justify-center md:justify-start gap-2">
+                <i data-lucide="file-spreadsheet" class="w-5 h-5 text-blue-600"></i>
+                Multi-Source Data Stream Ingestion
+              </h2>
+              <p class="text-xs text-slate-500 dark:text-slate-400">Load backend SQL database entries or upload statement CSV logs.</p>
+            </div>
+            
+            <div class="flex items-center gap-3 w-full md:w-auto flex-wrap">
+              <button id="btn-manual-load" onclick="initializeDataManual()" class="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md flex items-center gap-2 whitespace-nowrap">
+                <i data-lucide="database" class="w-4 h-4"></i>
+                <span>Load Database Records</span>
+              </button>
+
+              <label class="flex-1 md:flex-none flex items-center justify-center md:justify-start gap-2 px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0a0a0a] border border-dashed border-slate-300 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-300 font-medium cursor-pointer hover:border-blue-500 transition-all">
+                <i data-lucide="upload-cloud" class="w-4 h-4 text-blue-600"></i>
+                <span id="file-name-display">Upload Statement CSV</span>
+                <input type="file" id="bank-file-input" class="hidden" accept=".csv" onchange="handleFileSelect(event)">
+              </label>
+
+              <button id="btn-run" onclick="runReconciliation()" class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md flex items-center gap-2 whitespace-nowrap">
+                <i data-lucide="cpu" class="w-4 h-4"></i>
+                <span>Run AI Matcher</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Metric Cards -->
+        <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+          <div class="bg-white dark:bg-[#111] p-5 rounded-2xl space-y-3 border border-slate-200 dark:border-slate-800 shadow-sm">
+            <div class="flex items-center justify-between text-slate-500 dark:text-slate-400">
+              <span class="text-xs font-bold uppercase tracking-wider">Processed Batch</span>
+              <i data-lucide="database" class="w-4 h-4 text-blue-600"></i>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <span id="metric-total" class="text-3xl font-black text-slate-900 dark:text-white">0</span>
+              <span class="text-xs text-slate-500 font-medium">records</span>
+            </div>
+            <div class="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+              <div id="bar-total" class="bg-blue-600 h-full w-full transition-all duration-500"></div>
+            </div>
+          </div>
+
+          <div class="bg-white dark:bg-[#111] p-5 rounded-2xl space-y-3 border border-slate-200 dark:border-slate-800 shadow-sm">
+            <div class="flex items-center justify-between text-slate-500 dark:text-slate-400">
+              <span class="text-xs font-bold uppercase tracking-wider">Recon Accuracy</span>
+              <i data-lucide="shield-check" class="w-4 h-4 text-emerald-600"></i>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <span id="metric-accuracy" class="text-3xl font-black text-emerald-600 dark:text-emerald-400">0%</span>
+              <span class="text-xs text-emerald-600 dark:text-emerald-500 font-bold">Auto-Cleared</span>
+            </div>
+            <div class="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+              <div id="bar-accuracy" class="bg-emerald-500 h-full w-0 transition-all duration-500"></div>
+            </div>
+          </div>
+
+          <div class="bg-white dark:bg-[#111] p-5 rounded-2xl space-y-3 border border-slate-200 dark:border-slate-800 shadow-sm">
+            <div class="flex items-center justify-between text-slate-500 dark:text-slate-400">
+              <span class="text-xs font-bold uppercase tracking-wider">Unresolved Variances</span>
+              <i data-lucide="alert-triangle" class="w-4 h-4 text-amber-600"></i>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <span id="metric-exceptions" class="text-3xl font-black text-amber-600 dark:text-amber-400">0</span>
+              <span class="text-xs text-amber-600 dark:text-amber-500 font-bold">Action Required</span>
+            </div>
+            <div class="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+              <div id="bar-exceptions" class="bg-amber-500 h-full w-0 transition-all duration-500"></div>
+            </div>
+          </div>
+
+          <div class="bg-white dark:bg-[#111] p-5 rounded-2xl space-y-3 border border-slate-200 dark:border-slate-800 shadow-sm">
+            <div class="flex items-center justify-between text-slate-500 dark:text-slate-400">
+              <span class="text-xs font-bold uppercase tracking-wider">Engine Throughput</span>
+              <i data-lucide="zap" class="w-4 h-4 text-blue-600"></i>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <span id="metric-time" class="text-3xl font-black text-slate-900 dark:text-white">142</span>
+              <span class="text-xs text-slate-500 font-medium">milliseconds</span>
+            </div>
+            <div class="text-[11px] text-blue-600 dark:text-blue-400 font-mono font-bold bg-blue-50 dark:bg-blue-900/30 px-2 py-1 rounded inline-block">Stream Active</div>
+          </div>
+        </section>
+
+        <!-- Bulk Action Control Bar -->
+        <div id="batch-action-bar" class="hidden bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 p-3.5 rounded-xl flex items-center justify-between">
+          <div class="text-xs text-blue-800 dark:text-blue-300 font-medium flex items-center gap-2">
+            <i data-lucide="check-square" class="w-4 h-4 text-blue-600 dark:text-blue-400"></i>
+            <span id="selected-count" class="font-bold font-mono">0</span> transactions selected
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="bulkApproveMdr()" class="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg text-xs transition-all shadow-md">Bulk Approve MDR</button>
+          </div>
+        </div>
+
+        <!-- Data Table Section -->
+        <section class="bg-white dark:bg-[#111] rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div class="flex bg-slate-100 dark:bg-[#0a0a0a] p-1 rounded-xl border border-slate-200 dark:border-slate-800 w-full sm:w-auto overflow-x-auto">
+              <button onclick="setFilter('ALL')" id="filter-ALL" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-white bg-blue-600 transition-all whitespace-nowrap shadow-sm">All Records</button>
+              <button onclick="setFilter('EXACT_MATCH')" id="filter-EXACT_MATCH" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all whitespace-nowrap">Exact Match</button>
+              <button onclick="setFilter('PARTIAL_MATCH')" id="filter-PARTIAL_MATCH" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all whitespace-nowrap">Fee Variance</button>
+              <button onclick="setFilter('UNRESOLVED_EXCEPTION')" id="filter-UNRESOLVED_EXCEPTION" class="px-3.5 py-1.5 text-xs font-bold rounded-lg text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all whitespace-nowrap">Exceptions</button>
+            </div>
+
+            <div class="flex items-center gap-3 w-full sm:w-auto">
+              <div class="relative flex-1 sm:w-64">
+                <i data-lucide="search" class="w-4 h-4 absolute left-3 top-2.5 text-slate-400"></i>
+                <input type="text" id="search-input" onkeyup="renderTable()" placeholder="Search Transaction ID..." class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl pl-9 pr-4 py-2 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 font-mono placeholder-slate-400">
+              </div>
+
+              <button onclick="exportAuditTrailCSV()" class="px-4 py-2 bg-slate-100 dark:bg-[#050505] hover:bg-slate-200 dark:hover:bg-black border border-slate-200 dark:border-slate-800 text-xs font-bold text-slate-800 dark:text-white rounded-xl transition-all flex items-center gap-2 whitespace-nowrap shadow-sm">
+                <i data-lucide="download" class="w-4 h-4 text-emerald-600 dark:text-emerald-400"></i>
+                <span>Export Audit CSV</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+            <table class="w-full text-left text-xs text-slate-700 dark:text-slate-300">
+              <thead class="bg-slate-50 dark:bg-[#0a0a0a] text-slate-500 dark:text-slate-400 font-bold sticky top-0 z-10 border-b border-slate-200 dark:border-slate-800 uppercase tracking-wider text-[10px]">
+                <tr>
+                  <th class="py-3.5 px-4"><input type="checkbox" onchange="toggleSelectAll(this)" class="rounded bg-slate-100 dark:bg-slate-900 border-slate-300 dark:border-slate-700"></th>
+                  <th class="py-3.5 px-6">Transaction ID</th>
+                  <th class="py-3.5 px-6">Gateway Amount</th>
+                  <th class="py-3.5 px-6">Bank Credit</th>
+                  <th class="py-3.5 px-6">Clearing Status</th>
+                  <th class="py-3.5 px-6">Diagnosis / Root Cause</th>
+                  <th class="py-3.5 px-6 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody id="table-body" class="divide-y divide-slate-200 dark:divide-slate-800">
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <!-- BANKING TOOLS TAB -->
+      <div id="tab-content-banking" class="space-y-6 hidden">
+        <div class="bg-white dark:bg-[#111] p-6 rounded-2xl max-w-2xl mx-auto space-y-6 border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="border-b border-slate-200 dark:border-slate-800 pb-4">
+            <h3 class="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2">
+              <i data-lucide="landmark" class="w-5 h-5 text-blue-600"></i>
+              IFSC Code & UTR Payout Validator
+            </h3>
+            <p class="text-xs text-slate-500 dark:text-slate-400">Verify banking routes and virtual clearing account details instantly.</p>
+          </div>
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 mb-1.5">Enter IFSC Code or UTR Identifier</label>
+              <input type="text" id="banking-input" placeholder="e.g. RATN0VAICIC" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600 font-mono uppercase">
+            </div>
+            <button onclick="validateBankingCode()" class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md">Verify Routing Status</button>
+            <div id="banking-result" class="p-4 rounded-xl bg-slate-50 dark:bg-[#050505] border border-slate-200 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-300 space-y-1 hidden">
+              <p class="font-bold text-emerald-600 dark:text-emerald-400 mb-1">✓ Banking Route Verified Active</p>
+              <p>Bank: ICICI Bank Clearing Escrow</p>
+              <p>Branch: Razorpay Virtual Settlement Branch</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAX CALCULATOR TAB -->
+      <div id="tab-content-tax" class="space-y-6 hidden">
+        <div class="bg-white dark:bg-[#111] p-6 rounded-2xl max-w-2xl mx-auto space-y-6 border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="border-b border-slate-200 dark:border-slate-800 pb-4">
+            <h3 class="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2">
+              <i data-lucide="calculator" class="w-5 h-5 text-blue-600"></i>
+              Merchant MDR & GST Settlement Calculator
+            </h3>
+            <p class="text-xs text-slate-500 dark:text-slate-400">Calculate net payout after merchant discount rate and 18% GST tax deduction.</p>
+          </div>
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 mb-1">Gross Payout Amount (₹)</label>
+              <input type="number" id="tax-amount" value="10000" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600">
+            </div>
+            <div>
+              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 mb-1">MDR Rate (%)</label>
+              <input type="number" id="tax-rate" value="2.0" step="0.1" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600">
+            </div>
+            <button onclick="calculateTaxMDR()" class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md">Compute Settlement</button>
+            <div id="tax-result" class="p-4 rounded-xl bg-slate-50 dark:bg-[#050505] border border-slate-200 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-300 space-y-1 hidden">
+              <p class="font-bold text-slate-900 dark:text-white mb-2">Settlement Summary:</p>
+              <p id="res-gross">Gross Amount: ₹10,000.00</p>
+              <p id="res-fee">MDR Fee (2%): ₹200.00</p>
+              <p id="res-gst">GST on MDR (18%): ₹36.00</p>
+              <p id="res-net" class="font-bold text-emerald-600 dark:text-emerald-400 pt-2 border-t border-slate-200 dark:border-slate-800 mt-2">Net Expected Payout: ₹9,764.00</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- MONEY CONVERTER TAB -->
+      <div id="tab-content-converter" class="space-y-6 hidden">
+        <div class="bg-white dark:bg-[#111] p-6 rounded-2xl max-w-2xl mx-auto space-y-6 border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="border-b border-slate-200 dark:border-slate-800 pb-4">
+            <h3 class="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2">
+              <i data-lucide="repeat" class="w-5 h-5 text-blue-600"></i>
+              Multi-Currency Forex Settlement Converter
+            </h3>
+            <p class="text-xs text-slate-500 dark:text-slate-400">Convert foreign cross-border clearing payouts into INR.</p>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 mb-1">Amount</label>
+              <input type="number" id="conv-amount" value="1000" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600">
+            </div>
+            <div>
+              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 mb-1">Currency</label>
+              <select id="conv-currency" class="w-full bg-slate-50 dark:bg-[#0a0a0a] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-blue-600">
+                <option value="USD">USD ($)</option>
+                <option value="EUR">EUR (€)</option>
+                <option value="GBP">GBP (£)</option>
+                <option value="AUD">AUD ($)</option>
+              </select>
+            </div>
+          </div>
+          <button onclick="convertCurrency()" class="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-all shadow-md">Convert to INR (₹)</button>
+          <div id="conv-result" class="p-4 rounded-xl bg-slate-50 dark:bg-[#050505] border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 hidden">
+            <p id="conv-output" class="font-bold text-emerald-600 dark:text-emerald-400 text-sm">1,000 USD = ₹83,450.00 INR</p>
+            <p class="text-[10px] text-slate-500 mt-1">Synced with Live Forex Feed.</p>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+</body>
+</html>
